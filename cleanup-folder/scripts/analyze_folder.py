@@ -1,88 +1,198 @@
 #!/usr/bin/env python3
 """
-Analyze a folder for cleanup opportunities.
+Analyze a folder for cleanup opportunities:
+- True duplicate files (same MD5, differ only by copy suffix)
+- Installer files (DMG, PKG)
+- App bundles (.app directories)
+
 Usage: python3 analyze_folder.py <folder-path>
 Output: JSON to stdout
 """
-import hashlib, json, os, re, sys
+
+import hashlib
+import json
+import os
+import re
+import sys
+
 
 SUFFIX_PATTERN = re.compile(r'^(.*?)\s*\((\d+)\)(\.[^.]+)?$')
 INSTALLER_EXTENSIONS = {'.dmg', '.pkg'}
 
-def md5_file(fp, cs=8192):
+
+def md5_file(filepath, chunk_size=8192):
+    """Compute MD5 hash of a file."""
     h = hashlib.md5()
     try:
-        with open(fp, 'rb') as f:
+        with open(filepath, 'rb') as f:
             while True:
-                chunk = f.read(cs)
-                if not chunk: break
+                chunk = f.read(chunk_size)
+                if not chunk:
+                    break
                 h.update(chunk)
         return h.hexdigest()
-    except: return None
+    except (OSError, PermissionError):
+        return None
+
 
 def find_duplicates(folder):
-    files = [e.name for e in os.scandir(folder) if e.is_file(follow_symlinks=False)]
+    """Find files that are true duplicates: same MD5 + name differs only by suffix like (1), (2)."""
+    # Collect all files
+    files = []
+    for entry in os.scandir(folder):
+        if entry.is_file(follow_symlinks=False):
+            files.append(entry.name)
+
+    # Compute hashes
     hashes = {}
-    for n in files:
-        m5 = md5_file(os.path.join(folder, n))
-        if m5: hashes.setdefault(m5, []).append(n)
-    out = []
-    for m5, names in hashes.items():
-        if len(names) < 2: continue
-        for n in names:
-            m = SUFFIX_PATTERN.match(n)
+    for name in files:
+        path = os.path.join(folder, name)
+        md5 = md5_file(path)
+        if md5:
+            hashes.setdefault(md5, []).append(name)
+
+    # Find groups with duplicates
+    duplicates_to_delete = []
+    for md5, names in hashes.items():
+        if len(names) < 2:
+            continue
+
+        # For each file with a suffix pattern, check if the original exists in the same group
+        for name in names:
+            m = SUFFIX_PATTERN.match(name)
             if m:
-                orig = m.group(1) + (m.group(3) or '')
-                if orig in names:
-                    sz = os.path.getsize(os.path.join(folder, n))
-                    out.append({'file': n, 'original': orig, 'size': sz, 'md5': m5})
-    out.sort(key=lambda x: -x['size'])
-    return out
+                base = m.group(1)
+                ext = m.group(3) or ''
+                original = base + ext
+
+                if original in names:
+                    size = os.path.getsize(os.path.join(folder, name))
+                    duplicates_to_delete.append({
+                        'file': name,
+                        'original': original,
+                        'size': size,
+                        'md5': md5
+                    })
+
+    # Sort by size descending
+    duplicates_to_delete.sort(key=lambda x: -x['size'])
+    return duplicates_to_delete
+
 
 def find_installers(folder):
-    out = []
-    for e in os.scandir(folder):
-        if not e.is_file(follow_symlinks=False): continue
-        _, ext = os.path.splitext(e.name)
+    """Find DMG and PKG files, including extensionless copies."""
+    installers = []
+
+    for entry in os.scandir(folder):
+        if not entry.is_file(follow_symlinks=False):
+            continue
+
+        name = entry.name
+        _, ext = os.path.splitext(name)
+
         if ext.lower() in INSTALLER_EXTENSIONS:
-            out.append({'file': e.name, 'size': e.stat().st_size, 'type': ext.lower().lstrip('.')})
-    out.sort(key=lambda x: -x['size'])
-    return out
+            size = entry.stat().st_size
+            installers.append({
+                'file': name,
+                'size': size,
+                'type': ext.lower().lstrip('.')
+            })
+
+    # Sort by size descending
+    installers.sort(key=lambda x: -x['size'])
+    return installers
+
 
 def find_app_bundles(folder):
-    out = []
-    for e in os.scandir(folder):
-        if e.is_dir(follow_symlinks=False) and e.name.endswith('.app'):
-            sz, cnt = 0, 0
-            try:
-                for r, ds, fs in os.walk(e.path):
-                    for f in fs:
-                        try: sz += os.path.getsize(os.path.join(r, f)); cnt += 1
-                        except: pass
-            except: pass
-            out.append({'file': e.name, 'size': sz, 'file_count': cnt})
-    out.sort(key=lambda x: -x['size'])
-    return out
+    """Find .app directories."""
+    apps = []
 
-def fmt(sz):
-    if sz >= 1073741824: return f"{sz/1073741824:.1f} GB"
-    elif sz >= 1048576: return f"{sz/1048576:.1f} MB"
-    elif sz >= 1024: return f"{sz/1024:.0f} KB"
-    else: return f"{sz} B"
+    for entry in os.scandir(folder):
+        if entry.is_dir(follow_symlinks=False) and entry.name.endswith('.app'):
+            # Calculate total size
+            total_size = 0
+            file_count = 0
+            try:
+                for root, dirs, files in os.walk(entry.path):
+                    for f in files:
+                        fp = os.path.join(root, f)
+                        try:
+                            total_size += os.path.getsize(fp)
+                            file_count += 1
+                        except OSError:
+                            pass
+            except OSError:
+                pass
+
+            apps.append({
+                'file': entry.name,
+                'size': total_size,
+                'file_count': file_count
+            })
+
+    apps.sort(key=lambda x: -x['size'])
+    return apps
+
+
+def format_size(size_bytes):
+    """Human-readable file size."""
+    if size_bytes >= 1073741824:
+        return f"{size_bytes / 1073741824:.1f} GB"
+    elif size_bytes >= 1048576:
+        return f"{size_bytes / 1048576:.1f} MB"
+    elif size_bytes >= 1024:
+        return f"{size_bytes / 1024:.0f} KB"
+    else:
+        return f"{size_bytes} B"
+
 
 def main():
-    if len(sys.argv) < 2: print("Usage: python3 analyze_folder.py <path>", file=sys.stderr); sys.exit(1)
+    if len(sys.argv) < 2:
+        print("Usage: python3 analyze_folder.py <folder-path>", file=sys.stderr)
+        sys.exit(1)
+
     folder = sys.argv[1]
-    if not os.path.isdir(folder): print(f"Error: '{ folder}' not a dir", file=sys.stderr); sys.exit(1)
-    dups = find_duplicates(folder)
-    inst = find_installers(folder)
-    apps = find_app_bundles(folder)
-    total = sum(1 for e in os.scandir(folder) if e.is_file(follow_symlinks=False))
-    result = {'folder': folder, 'total_files': total,
-        'duplicates': {'fount': len(dups), 'total_size': sum(d['size'] for d in dups), 'total_size_human': fmt(sum(d['size'] for d in dups)), 'items': dups},
-        'installers': {'count': len(inst), 'total_size': sum(i['size'] for i in inst), 'total_size_human': fmt(sum(i['size'] for i in inst)), 'items': inst},
-        'app_bundles': {'count': len(apps), 'total_size': sum(a['size'] for a in apps), 'total_size_human': fmt(sum(a['size'] for a in apps)), 'items': apps},
-        'total_recoverable_size': fmt(sum(d['size'] for d in dups)+sum(i['size'] for i in inst)+sum(a['size'] for a in apps))}
+
+    if not os.path.isdir(folder):
+        print(f"Error: '{folder}' is not a directory", file=sys.stderr)
+        sys.exit(1)
+
+    duplicates = find_duplicates(folder)
+    installers = find_installers(folder)
+    app_bundles = find_app_bundles(folder)
+
+    total_files = sum(1 for e in os.scandir(folder) if e.is_file(follow_symlinks=False))
+
+    result = {
+        'folder': folder,
+        'total_files': total_files,
+        'duplicates': {
+            'count': len(duplicates),
+            'total_size': sum(d['size'] for d in duplicates),
+            'total_size_human': format_size(sum(d['size'] for d in duplicates)),
+            'items': duplicates
+        },
+        'installers': {
+            'count': len(installers),
+            'total_size': sum(i['size'] for i in installers),
+            'total_size_human': format_size(sum(i['size'] for i in installers)),
+            'items': installers
+        },
+        'app_bundles': {
+            'count': len(app_bundles),
+            'total_size': sum(a['size'] for a in app_bundles),
+            'total_size_human': format_size(sum(a['size'] for a in app_bundles)),
+            'items': app_bundles
+        },
+        'total_recoverable_size': format_size(
+            sum(d['size'] for d in duplicates) +
+            sum(i['size'] for i in installers) +
+            sum(a['size'] for a in app_bundles)
+        )
+    }
+
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
-if __name__ == '__main__': main()
+
+if __name__ == '__main__':
+    main()
